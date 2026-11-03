@@ -1,0 +1,219 @@
+name: Service Health & Uptime Monitoring
+
+on:
+  schedule:
+    # Run every 30 minutes for continuous health monitoring
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: 'URL of deployed application to monitor'
+        required: false
+        default: 'https://ipswitch.onrender.com'
+
+jobs:
+  monitor:
+    name: Application Health & Accessibility Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Determine Target URL
+        id: target
+        run: |
+          URL="${{ inputs.target_url }}"
+          if [ -z "$URL" ]; then
+            URL="${{ secrets.RENDER_APP_URL }}"
+          fi
+          if [ -z "$URL" ]; then
+            URL="https://ipswitch.onrender.com"
+          fi
+          URL="${URL%/}"
+          echo "Target URL: $URL"
+          echo "url=$URL" >> $GITHUB_OUTPUT
+
+      - name: Execute Service Health Probes
+        id: health_check
+        run: |
+          TARGET_URL="${{ steps.target.outputs.url }}"
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          SAFE_TS=$(date -u +"%Y%m%d_%H%M%S")
+          mkdir -p monitoring_logs
+          LOG_FILE="monitoring_logs/health_report_${SAFE_TS}.log"
+          JSON_FILE="monitoring_logs/health_report.json"
+
+          echo "=== Ipswich Retail Service Health Monitoring ===" | tee "$LOG_FILE"
+          echo "Timestamp: $TIMESTAMP" | tee -a "$LOG_FILE"
+          echo "Target Host: $TARGET_URL" | tee -a "$LOG_FILE"
+          echo "" | tee -a "$LOG_FILE"
+
+          FAILURES=0
+
+          # 1. Probe Health Endpoint (/health/)
+          echo "--> Probing /health/ endpoint..." | tee -a "$LOG_FILE"
+          HEALTH_RESPONSE=$(curl -s -w "\n%{http_code} %{time_total}" --max-time 60 --retry 3 --retry-delay 5 "$TARGET_URL/health/" || echo -e "\n000 0.0")
+          HEALTH_BODY=$(echo "$HEALTH_RESPONSE" | sed '$d')
+          HEALTH_STATS=$(echo "$HEALTH_RESPONSE" | tail -n1)
+          HEALTH_CODE=$(echo "$HEALTH_STATS" | awk '{print $1}')
+          HEALTH_LATENCY=$(echo "$HEALTH_STATS" | awk '{print $2}')
+
+          echo "HTTP Status: $HEALTH_CODE | Latency: ${HEALTH_LATENCY}s" | tee -a "$LOG_FILE"
+          echo "Response Body: $HEALTH_BODY" | tee -a "$LOG_FILE"
+
+          if [ "$HEALTH_CODE" -eq 200 ] && echo "$HEALTH_BODY" | grep -q '"ok"'; then
+            HEALTH_STATUS="PASSED"
+            echo "Health endpoint: OK" | tee -a "$LOG_FILE"
+          else
+            HEALTH_STATUS="FAILED"
+            echo "Health endpoint: FAILED (Code: $HEALTH_CODE)" | tee -a "$LOG_FILE"
+            FAILURES=$((FAILURES + 1))
+          fi
+          echo "" | tee -a "$LOG_FILE"
+
+          # 2. Probe Root Storefront (/)
+          echo "--> Probing Root Storefront (/)..." | tee -a "$LOG_FILE"
+          STORE_RESPONSE=$(curl -s -w "\n%{http_code} %{time_total}" --max-time 60 --retry 3 --retry-delay 5 "$TARGET_URL/" || echo -e "\n000 0.0")
+          STORE_STATS=$(echo "$STORE_RESPONSE" | tail -n1)
+          STORE_CODE=$(echo "$STORE_STATS" | awk '{print $1}')
+          STORE_LATENCY=$(echo "$STORE_STATS" | awk '{print $2}')
+
+          echo "HTTP Status: $STORE_CODE | Latency: ${STORE_LATENCY}s" | tee -a "$LOG_FILE"
+          if [ "$STORE_CODE" -eq 200 ]; then
+            STORE_STATUS="PASSED"
+            echo "Storefront endpoint: OK" | tee -a "$LOG_FILE"
+          else
+            STORE_STATUS="FAILED"
+            echo "Storefront endpoint: FAILED (Code: $STORE_CODE)" | tee -a "$LOG_FILE"
+            FAILURES=$((FAILURES + 1))
+          fi
+          echo "" | tee -a "$LOG_FILE"
+
+          # 3. Probe Prometheus Metrics (/metrics)
+          echo "--> Probing Prometheus Metrics (/metrics)..." | tee -a "$LOG_FILE"
+          METRICS_RESPONSE=$(curl -s -w "\n%{http_code} %{time_total}" --max-time 60 --retry 3 --retry-delay 5 "$TARGET_URL/metrics" || echo -e "\n000 0.0")
+          METRICS_STATS=$(echo "$METRICS_RESPONSE" | tail -n1)
+          METRICS_CODE=$(echo "$METRICS_STATS" | awk '{print $1}')
+          METRICS_LATENCY=$(echo "$METRICS_STATS" | awk '{print $2}')
+
+          echo "HTTP Status: $METRICS_CODE | Latency: ${METRICS_LATENCY}s" | tee -a "$LOG_FILE"
+          if [ "$METRICS_CODE" -eq 200 ]; then
+            METRICS_STATUS="PASSED"
+            echo "Metrics endpoint: OK" | tee -a "$LOG_FILE"
+          else
+            METRICS_STATUS="FAILED"
+            echo "Metrics endpoint: FAILED (Code: $METRICS_CODE)" | tee -a "$LOG_FILE"
+            FAILURES=$((FAILURES + 1))
+          fi
+          echo "" | tee -a "$LOG_FILE"
+
+          # Overall Status
+          if [ "$FAILURES" -eq 0 ]; then
+            OVERALL_STATUS="HEALTHY"
+          else
+            OVERALL_STATUS="UNHEALTHY"
+          fi
+
+          # Output structured JSON report cleanly without heredoc indentation issues
+          {
+            echo "{"
+            echo "  \"timestamp\": \"$TIMESTAMP\","
+            echo "  \"target_url\": \"$TARGET_URL\","
+            echo "  \"total_failures\": $FAILURES,"
+            echo "  \"overall_status\": \"$OVERALL_STATUS\","
+            echo "  \"checks\": {"
+            echo "    \"health\": {"
+            echo "      \"endpoint\": \"/health/\","
+            echo "      \"status\": \"$HEALTH_STATUS\","
+            echo "      \"http_code\": \"$HEALTH_CODE\","
+            echo "      \"latency_seconds\": \"$HEALTH_LATENCY\""
+            echo "    },"
+            echo "    \"storefront\": {"
+            echo "      \"endpoint\": \"/\","
+            echo "      \"status\": \"$STORE_STATUS\","
+            echo "      \"http_code\": \"$STORE_CODE\","
+            echo "      \"latency_seconds\": \"$STORE_LATENCY\""
+            echo "    },"
+            echo "    \"metrics\": {"
+            echo "      \"endpoint\": \"/metrics\","
+            echo "      \"status\": \"$METRICS_STATUS\","
+            echo "      \"http_code\": \"$METRICS_CODE\","
+            echo "      \"latency_seconds\": \"$METRICS_LATENCY\""
+            echo "    }"
+            echo "  }"
+            echo "}"
+          } > "$JSON_FILE"
+
+          # Pass step outputs for summary and evaluation
+          echo "failures=$FAILURES" >> $GITHUB_OUTPUT
+          echo "health_status=$HEALTH_STATUS" >> $GITHUB_OUTPUT
+          echo "health_code=$HEALTH_CODE" >> $GITHUB_OUTPUT
+          echo "health_latency=${HEALTH_LATENCY}s" >> $GITHUB_OUTPUT
+          echo "store_status=$STORE_STATUS" >> $GITHUB_OUTPUT
+          echo "store_code=$STORE_CODE" >> $GITHUB_OUTPUT
+          echo "store_latency=${STORE_LATENCY}s" >> $GITHUB_OUTPUT
+          echo "metrics_status=$METRICS_STATUS" >> $GITHUB_OUTPUT
+          echo "metrics_code=$METRICS_CODE" >> $GITHUB_OUTPUT
+          echo "metrics_latency=${METRICS_LATENCY}s" >> $GITHUB_OUTPUT
+
+      - name: Record Monitoring Summary
+        if: always()
+        run: |
+          TARGET="${{ steps.target.outputs.url }}"
+          FAILURES="${{ steps.health_check.outputs.failures }}"
+          H_STATUS="${{ steps.health_check.outputs.health_status }}"
+          S_STATUS="${{ steps.health_check.outputs.store_status }}"
+          M_STATUS="${{ steps.health_check.outputs.metrics_status }}"
+
+          if [ "$H_STATUS" = "PASSED" ]; then
+            H_BADGE=":white_check_mark: Healthy"
+          else
+            H_BADGE=":x: Failed"
+          fi
+
+          if [ "$S_STATUS" = "PASSED" ]; then
+            S_BADGE=":white_check_mark: Healthy"
+          else
+            S_BADGE=":x: Failed"
+          fi
+
+          if [ "$M_STATUS" = "PASSED" ]; then
+            M_BADGE=":white_check_mark: Healthy"
+          else
+            M_BADGE=":x: Failed"
+          fi
+
+          echo "## :satellite: Service Health Monitoring Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Monitored Target:** \`$TARGET\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Execution Time:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "$FAILURES" -eq 0 ]; then
+            echo "### :white_check_mark: All Health Checks Passed — Service is Operational" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### :x: ALERT: Service Degradation Detected ($FAILURES failure(s) recorded)" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "| Endpoint | Target Path | Status | HTTP Code | Latency |" >> $GITHUB_STEP_SUMMARY
+          echo "| :--- | :--- | :--- | :--- | :--- |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Health API** | \`/health/\` | $H_BADGE | \`${{ steps.health_check.outputs.health_code }}\` | ${{ steps.health_check.outputs.health_latency }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Storefront** | \`/\` | $S_BADGE | \`${{ steps.health_check.outputs.store_code }}\` | ${{ steps.health_check.outputs.store_latency }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Prometheus** | \`/metrics\` | $M_BADGE | \`${{ steps.health_check.outputs.metrics_code }}\` | ${{ steps.health_check.outputs.metrics_latency }} |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload Health Monitoring Logs & Failure Records
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: service-health-logs
+          path: monitoring_logs/
+          retention-days: 14
+
+      - name: Evaluate Monitoring Result
+        run: |
+          FAILURES="${{ steps.health_check.outputs.failures }}"
+          if [ "$FAILURES" -gt 0 ]; then
+            echo "::error::Health check detected $FAILURES endpoint failure(s). Check step summary and artifact logs for details."
+            exit 1
+          else
+            echo "All probed endpoints returned HTTP 200 OK. Service is healthy."
+          fi

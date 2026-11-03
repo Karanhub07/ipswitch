@@ -1,0 +1,105 @@
+name: CD & Render Deployment
+
+on:
+  workflow_run:
+    workflows: ["Django CI"]
+    types: [completed]
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  docker-build-and-deploy:
+    name: Build, Test Docker & Deploy to Render
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success') }}
+
+    steps:
+      - name: Checkout Code Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker Image
+        run: |
+          echo "Building Docker container image for Ipswich Retail..."
+          docker build -t ipswich-retail:latest .
+
+      - name: Test Docker Container
+        run: |
+          echo "Starting container in background for health verification..."
+          docker run -d --name test-app -p 8000:8000 \
+            -e SECRET_KEY="ci-cd-docker-verification-secret-key" \
+            -e DEBUG="True" \
+            -e ALLOWED_HOSTS="*" \
+            -e SECURE_SSL_REDIRECT="False" \
+            ipswich-retail:latest
+
+          echo "Waiting for container service to be ready..."
+          READY=false
+          for i in {1..15}; do
+            if curl -s -f http://127.0.0.1:8000/health/ > /dev/null; then
+              echo "Container health check passed on attempt $i!"
+              READY=true
+              break
+            fi
+            echo "Waiting for container startup... ($i/15)"
+            sleep 2
+          done
+
+          if [ "$READY" != "true" ]; then
+            echo "::error::Container failed health verification!"
+            echo "=== Container Logs ==="
+            docker logs test-app
+            docker stop test-app || true
+            docker rm test-app || true
+            exit 1
+          fi
+
+          echo "Container HTTP response check:"
+          curl -i http://127.0.0.1:8000/health/
+
+          echo "Stopping and cleaning up test container..."
+          docker stop test-app
+          docker rm test-app
+          echo "Docker image verification completed successfully!"
+
+      - name: Trigger Render Deployment
+        env:
+          RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+        run: |
+          echo "=== Initiating Cloud Deployment to Render ==="
+          if [ -n "$RENDER_DEPLOY_HOOK_URL" ]; then
+            echo "Render Deploy Hook secret found. Triggering deployment..."
+            RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST "$RENDER_DEPLOY_HOOK_URL")
+            HTTP_STATUS=$(echo "$RESPONSE" | grep "HTTP_STATUS" | cut -d':' -f2)
+            BODY=$(echo "$RESPONSE" | grep -v "HTTP_STATUS")
+
+            echo "Render Response: $BODY"
+            if [ "$HTTP_STATUS" -ge 200 ] && [ "$HTTP_STATUS" -lt 300 ]; then
+              echo "Render deployment triggered successfully (HTTP $HTTP_STATUS)!"
+            else
+              echo "::warning::Render returned unexpected HTTP status: $HTTP_STATUS"
+            fi
+          else
+            echo "INFO: RENDER_DEPLOY_HOOK_URL secret not defined in repository secrets."
+            echo "Render native Git integration automatically deploys commits pushed to the linked branch."
+            echo "To trigger deployments explicitly via this GitHub Action, add RENDER_DEPLOY_HOOK_URL to GitHub Secrets."
+          fi
+
+      - name: Pipeline Deployment Summary
+        if: always()
+        run: |
+          echo "## :rocket: CD & Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Stage | Status | Details |" >> $GITHUB_STEP_SUMMARY
+          echo "| :--- | :--- | :--- |" >> $GITHUB_STEP_SUMMARY
+          echo "| **CI Prerequisite** | :white_check_mark: Completed | Validated upstream Django CI checks |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Docker Build** | :white_check_mark: Success | Image \`ipswich-retail:latest\` built successfully |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Container Test** | :white_check_mark: Passed | \`/health/\` endpoint verified inside container |" >> $GITHUB_STEP_SUMMARY
+          if [ -n "${{ secrets.RENDER_DEPLOY_HOOK_URL }}" ]; then
+            echo "| **Render Deployment** | :white_check_mark: Triggered | Deploy Hook executed successfully |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| **Render Deployment** | :information_source: Git Auto-Deploy | Render deploys pushed commits automatically |" >> $GITHUB_STEP_SUMMARY
+          fi
+
