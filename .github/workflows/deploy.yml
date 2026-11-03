@@ -2,7 +2,7 @@ name: CD & Render Deployment
 
 on:
   workflow_run:
-    workflows: ["Django CI"]
+    workflows: ["Django CI Deploy"]
     types: [completed]
     branches: [main, master]
   workflow_dispatch:
